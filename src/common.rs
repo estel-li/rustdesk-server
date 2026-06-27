@@ -1,6 +1,8 @@
 use clap::App;
 use hbb_common::{
-    allow_err, anyhow::{Context, Result}, get_version_number, log, tokio, ResultType
+    allow_err,
+    anyhow::{Context, Result},
+    get_version_number, log, tokio, ResultType,
 };
 use ini::Ini;
 use sodiumoxide::crypto::sign;
@@ -189,6 +191,122 @@ pub async fn listen_signal() -> Result<()> {
     unreachable!();
 }
 
+// ============================================================================
+// CE-M0-7: 管理 CLI 默认路径 / 配置解析。
+// 环境优先级:env (init_args 大写形式) > systemd `RUNTIME_DIRECTORY` > 默认。
+// ============================================================================
+
+/// systemd 注入的运行期目录(`RuntimeDirectory=` 对应 `RUNTIME_DIRECTORY`)。
+/// 未运行在 systemd 下时返回 None。
+fn systemd_runtime_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("RUNTIME_DIRECTORY").map(std::path::PathBuf::from)
+}
+
+fn systemd_state_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("STATE_DIRECTORY").map(std::path::PathBuf::from)
+}
+
+/// 管理 CLI socket 默认路径。`role` = "hbbs" | "hbbr"。
+pub fn admin_default_socket(role: &str) -> std::path::PathBuf {
+    if let Some(d) = systemd_runtime_dir() {
+        return d.join(format!("{}.sock", role));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return std::path::PathBuf::from(format!("/run/rustdesk-server/{}.sock", role));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return std::path::PathBuf::from(format!("/tmp/rustdesk-{}.sock", role));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = role;
+        return std::path::PathBuf::new(); // Windows 默认不用 UDS
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        return std::path::PathBuf::from(format!("/tmp/rustdesk-{}.sock", role));
+    }
+}
+
+/// 管理 token 文件默认路径。
+pub fn admin_default_token_file() -> std::path::PathBuf {
+    if let Some(d) = systemd_state_dir() {
+        return d.join("admin.token");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return std::path::PathBuf::from("/var/lib/rustdesk-server/admin.token");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return std::path::PathBuf::from("/tmp/rustdesk-admin.token");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(d) = std::env::var_os("PROGRAMDATA") {
+            let mut p = std::path::PathBuf::from(d);
+            p.push("rustdesk-server");
+            p.push("admin.token");
+            return p;
+        }
+        return std::path::PathBuf::from("C:\\ProgramData\\rustdesk-server\\admin.token");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        return std::path::PathBuf::from("/tmp/rustdesk-admin.token");
+    }
+}
+
+/// 由 CLI/env 组装 `AdminConfig`。
+/// `role` 仅用于决定 socket 默认路径。
+pub fn admin_config_from_env(role: &str) -> crate::admin_cli::AdminConfig {
+    use crate::admin_cli::AdminConfig;
+    let disabled = get_arg("admin-disable").to_uppercase() == "Y";
+
+    // socket: 显式给空字符串 = 不启用 UDS;未给则用默认路径(Windows 默认为空)。
+    let sock_arg = std::env::var(arg_name("admin-socket")).ok();
+    let socket_path = match sock_arg {
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(std::path::PathBuf::from(s)),
+        None => {
+            let p = admin_default_socket(role);
+            if p.as_os_str().is_empty() {
+                None
+            } else {
+                Some(p)
+            }
+        }
+    };
+
+    // tcp: Linux/macOS 默认空;Windows 默认 127.0.0.1:0(随机端口写到 token 文件)。
+    let tcp_arg = std::env::var(arg_name("admin-tcp")).ok();
+    let tcp_addr = match tcp_arg {
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(s),
+        None => {
+            if cfg!(target_os = "windows") {
+                Some("127.0.0.1:0".to_string())
+            } else {
+                None
+            }
+        }
+    };
+
+    let token_file_arg = std::env::var(arg_name("admin-token-file")).ok();
+    let token_file = match token_file_arg {
+        Some(s) if !s.is_empty() => std::path::PathBuf::from(s),
+        _ => admin_default_token_file(),
+    };
+
+    AdminConfig {
+        socket_path,
+        tcp_addr,
+        token_file,
+        disabled,
+    }
+}
 
 pub fn check_software_update() {
     const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
@@ -200,8 +318,10 @@ pub fn check_software_update() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn check_software_update_() -> hbb_common::ResultType<()> {
-    let (request, url) = hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
-    let latest_release_response = reqwest::Client::builder().build()?
+    let (request, url) =
+        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());
+    let latest_release_response = reqwest::Client::builder()
+        .build()?
         .post(url)
         .json(&request)
         .send()
@@ -212,7 +332,7 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
     let response_url = resp.url;
     let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
     if get_version_number(&latest_release_version) > get_version_number(crate::version::VERSION) {
-       log::info!("new version is available: {}", latest_release_version);
+        log::info!("new version is available: {}", latest_release_version);
     }
     Ok(())
 }

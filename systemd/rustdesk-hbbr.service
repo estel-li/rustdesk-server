@@ -1,4 +1,3 @@
-
 [Unit]
 Description=Rustdesk Relay Server
 
@@ -7,8 +6,30 @@ Type=simple
 LimitNOFILE=1000000
 ExecStart=/usr/bin/hbbr
 WorkingDirectory=/var/lib/rustdesk-server/
-User=
-Group=
+# CE-M0-5: run as a dedicated unprivileged user/group; CE-M0-7 relies on this
+# uid/gid being stable so the admin UDS chmod 0660 + SO_PEERCRED check is meaningful.
+User=rustdesk
+Group=rustdesk
+# CE-M0-7: systemd-managed runtime/state directories for the admin CLI.
+RuntimeDirectory=rustdesk-server
+RuntimeDirectoryMode=0750
+StateDirectory=rustdesk-server
+StateDirectoryMode=0750
+# CE-M0-5: systemd 沙箱加固。hbbr 写入路径与 hbbs 一致(共用 /var/lib/rustdesk-server
+# 与 /var/log/rustdesk-server)。日志目录非 StateDirectory,必须显式列入
+# ReadWritePaths 否则 append 写入会因 ProtectSystem=strict 失败。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/rustdesk-server /var/log/rustdesk-server
 Restart=always
 StandardOutput=append:/var/log/rustdesk-server/hbbr.log
 StandardError=append:/var/log/rustdesk-server/hbbr.error
@@ -17,4 +38,3 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-

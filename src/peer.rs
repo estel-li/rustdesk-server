@@ -81,11 +81,13 @@ impl PeerMap {
             }
             db
         });
-        log::info!("DB_URL={}", db);
+        // CE-M0-2: DSN 中若含密码(典型如 postgres://user:pass@host)需脱敏后再落盘日志。
+        log::info!("DB_URL={}", database::mask_db_url(&db));
         let pm = Self {
             map: Default::default(),
             db: database::Database::new(&db).await?,
         };
+        log::info!("DB backend kind: {}", pm.db.backend_kind());
         Ok(pm)
     }
 
@@ -176,5 +178,139 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+
+    /// CE-M0-3: PeerMap in-memory 条目数,用于 `hbbs_peermap_entries` gauge 采样。
+    #[inline]
+    pub(crate) async fn len_in_memory(&self) -> usize {
+        self.map.read().await.len()
+    }
+
+    /// CE-M0-3: 当前在线 peer 数(`last_reg_time` 在 `REG_TIMEOUT` 内)。
+    /// 仅遍历内存 PeerMap,不触达 DB,避免周期采样阻塞热路径。
+    #[inline]
+    pub(crate) async fn peers_online(&self, reg_timeout_ms: u128) -> usize {
+        let map = self.map.read().await;
+        let mut n = 0usize;
+        for p in map.values() {
+            let r = p.read().await;
+            if r.last_reg_time.elapsed().as_millis() < reg_timeout_ms {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// CE-M0-6: 回收内存层 PeerMap 中 `last_reg_time.elapsed() >= ttl_secs` 的条目。
+    ///
+    /// 设计要点:
+    ///   * DB 行不动 —— 内存层仅作缓存,过期重新登录或被请求时会从 DB lazy-load 回来;
+    ///   * 默认构造的 placeholder(`last_reg_time = get_expired_time()`,见 `Peer::default`)
+    ///     会被视为过期并剔除,避免 `get_or` 插入后从未注册的占位行永久驻留;
+    ///   * 不复用 `IP_BLOCKER` / `IP_CHANGES` 的清理路径,保留它们各自的过期语义不变。
+    ///
+    /// 返回被剔除的条目数。
+    pub(crate) async fn gc(&self, ttl_secs: u64) -> usize {
+        // 先在读锁下挑出待删 key,减少 write 锁占用时间。
+        let stale: Vec<String> = {
+            let map = self.map.read().await;
+            let mut v = Vec::new();
+            for (k, p) in map.iter() {
+                let r = p.read().await;
+                if r.last_reg_time.elapsed().as_secs() >= ttl_secs {
+                    v.push(k.clone());
+                }
+            }
+            v
+        };
+        if stale.is_empty() {
+            return 0;
+        }
+        let mut w = self.map.write().await;
+        let mut n = 0usize;
+        for k in stale {
+            // 复检:可能在拿到 write 锁前刚被刷新过,避免误删。
+            if let Some(p) = w.get(&k) {
+                let r = p.read().await;
+                if r.last_reg_time.elapsed().as_secs() >= ttl_secs {
+                    drop(r);
+                    w.remove(&k);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // CE-M0-6: PeerMap::gc 直接需要一个 Database 实例,这里走 sqlite in-memory
+    // (默认 backend),不需要任何外部依赖。
+    use super::*;
+    use hbb_common::tokio;
+
+    async fn make_pm() -> PeerMap {
+        // sqlite 文件 backend(`:memory:` 会在 new_sqlite 中被当作普通路径,
+        // 会创建一个名为 `:memory:` 的文件;改用临时目录里的唯一文件名,跑完测试不清理也无害)。
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let mut path = std::env::temp_dir();
+        path.push(format!("rustdesk_ce_m0_6_peer_gc_{nonce}.sqlite3"));
+        let url = path.to_string_lossy().to_string();
+        let db = database::Database::new(&url).await.expect("sqlite open");
+        PeerMap {
+            map: Arc::new(RwLock::new(HashMap::new())),
+            db,
+        }
+    }
+
+    async fn insert_placeholder(pm: &PeerMap, id: &str) -> LockPeer {
+        let p = LockPeer::default();
+        pm.map.write().await.insert(id.to_owned(), p.clone());
+        p
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_peer_map_gc_evicts_stale() {
+        let pm = make_pm().await;
+        let _ = insert_placeholder(&pm, "stale").await;
+        let active = insert_placeholder(&pm, "active").await;
+        // active: 把 last_reg_time 刷成 now
+        active.write().await.last_reg_time = Instant::now();
+        // stale: 显式回退到 600s 前
+        // get the stale peer
+        let stale_peer = pm.map.read().await.get("stale").cloned().unwrap();
+        stale_peer.write().await.last_reg_time = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .unwrap_or_else(Instant::now);
+        let n = pm.gc(120).await;
+        assert_eq!(n, 1);
+        assert_eq!(pm.len_in_memory().await, 1);
+        assert!(pm.is_in_memory("active").await);
+        assert!(!pm.is_in_memory("stale").await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_peer_map_gc_keeps_recent() {
+        let pm = make_pm().await;
+        let p = insert_placeholder(&pm, "fresh").await;
+        p.write().await.last_reg_time = Instant::now();
+        let n = pm.gc(120).await;
+        assert_eq!(n, 0);
+        assert!(pm.is_in_memory("fresh").await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_peer_map_gc_backward_compat_default_last_reg_time() {
+        // 默认 Peer::default() 的 last_reg_time = get_expired_time(),距 now 已 > 1h,
+        // 应被视为过期并剔除,避免 get_or 插入后从未注册的 placeholder 永久驻留。
+        let pm = make_pm().await;
+        let _ = insert_placeholder(&pm, "ghost").await;
+        let n = pm.gc(120).await;
+        assert_eq!(n, 1);
+        assert!(!pm.is_in_memory("ghost").await);
     }
 }

@@ -1,3 +1,4 @@
+use crate::metrics as ce_metrics;
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
 use hbb_common::{
@@ -12,7 +13,6 @@ use hbb_common::{
     timeout,
     tokio::{
         self,
-        io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         sync::{Mutex, RwLock},
         time::{interval, Duration},
@@ -44,6 +44,10 @@ static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // i
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
+
+// CE-M0-7: admin CLI 需要在监听协程里拿到当前 Limiter 才能下发 `tb` 等命令,
+// 这里抽成全局 OnceCell,由 `io_loop` 初始化、admin handler 只读取 clone。
+static GLOBAL_LIMITER: once_cell::sync::OnceCell<Limiter> = once_cell::sync::OnceCell::new();
 
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start(port: &str, key: &str) -> ResultType<()> {
@@ -82,6 +86,12 @@ pub async fn start(port: &str, key: &str) -> ResultType<()> {
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
+    // CE-M0-7: 启动 UDS + token 管理 CLI。
+    {
+        let admin_cfg = crate::common::admin_config_from_env("hbbr");
+        let handler = std::sync::Arc::new(AdminCmdImpl);
+        crate::admin_cli::spawn_listener("hbbr", admin_cfg, handler);
+    }
     let main_task = async move {
         loop {
             log::info!("Start");
@@ -325,7 +335,10 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
 
 async fn io_loop(listener: TcpListener, listener2: TcpListener, key: &str) {
     check_params();
-    let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+    // CE-M0-7: 把 limiter 写入全局 OnceCell,供 admin CLI 读取/调整 total-bandwidth。
+    let limiter = GLOBAL_LIMITER
+        .get_or_init(|| <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _))
+        .clone();
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -364,22 +377,12 @@ async fn handle_connection(
     ws: bool,
 ) {
     let ip = hbb_common::try_into_v4(addr).ip();
-    if !ws && ip.is_loopback() {
-        let limiter = limiter.clone();
-        tokio::spawn(async move {
-            let mut stream = stream;
-            let mut buffer = [0; 1024];
-            if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
-                if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
-                    let res = check_cmd(data, limiter).await;
-                    stream.write(res.as_bytes()).await.ok();
-                }
-            }
-        });
-        return;
-    }
-    let ip = ip.to_string();
+    // CE-M0-7: 旧 `!ws && ip.is_loopback()` 旁路(零认证管理 CLI)已删除,
+    // 改走 `admin_cli` 模块的 UDS + token 通道。中继端口只跑中继协议。
+    let _ = ip; // 避免编译器报未使用警告
+    let ip = hbb_common::try_into_v4(addr).ip().to_string();
     if BLOCKLIST.read().await.get(&ip).is_some() {
+        ce_metrics::inc_blocked("block_pre_pair"); // CE-M0-3
         log::info!("{} blocked", ip);
         return;
     }
@@ -434,6 +437,9 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                 if !rf.uuid.is_empty() {
                     let mut peer = PEERS.lock().await.remove(&rf.uuid);
                     if let Some(peer) = peer.as_mut() {
+                        // CE-M0-3: 配对成功,pending --,sessions ++
+                        ce_metrics::inc_pair_pending(-1);
+                        ce_metrics::inc_session_active(1);
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
@@ -449,11 +455,17 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             log::info!("Relay of {} closed", addr);
                         }
                         USAGE.write().await.remove(&id);
+                        ce_metrics::inc_session_active(-1); // CE-M0-3
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
                         PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+                        ce_metrics::inc_pair_pending(1); // CE-M0-3
                         sleep(30.).await;
-                        PEERS.lock().await.remove(&rf.uuid);
+                        // 若 30s 内未配对成功,remove 仍能命中,即为 timeout。
+                        if PEERS.lock().await.remove(&rf.uuid).is_some() {
+                            ce_metrics::inc_pair_timeout();
+                            ce_metrics::inc_pair_pending(-1);
+                        }
                     }
                 }
             }
@@ -489,18 +501,26 @@ async fn relay(
                 if let Some(Ok(bytes)) = res {
                     last_recv_time = std::time::Instant::now();
                     let nb = bytes.len() * 8;
+                    ce_metrics::add_bytes("in", nb as u64); // CE-M0-3
                     if blacked || downgrade {
+                        ce_metrics::inc_limiter_consume("downgrade_blacked"); // CE-M0-3
                         blacklist_limiter.consume(nb).await;
                     } else {
+                        ce_metrics::inc_limiter_consume("normal"); // CE-M0-3
                         limiter.consume(nb).await;
                     }
+                    ce_metrics::inc_limiter_consume("total"); // CE-M0-3
                     total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        stream.send_raw(bytes.into()).await?;
+                        if let Err(e) = stream.send_raw(bytes.into()).await {
+                            ce_metrics::inc_relay_close("send_err"); // CE-M0-3
+                            return Err(e);
+                        }
                     }
                 } else {
+                    ce_metrics::inc_relay_close("peer_eof"); // CE-M0-3
                     break;
                 }
             },
@@ -508,23 +528,32 @@ async fn relay(
                 if let Some(Ok(bytes)) = res {
                     last_recv_time = std::time::Instant::now();
                     let nb = bytes.len() * 8;
+                    ce_metrics::add_bytes("out", nb as u64); // CE-M0-3
                     if blacked || downgrade {
+                        ce_metrics::inc_limiter_consume("downgrade_blacked"); // CE-M0-3
                         blacklist_limiter.consume(nb).await;
                     } else {
+                        ce_metrics::inc_limiter_consume("normal"); // CE-M0-3
                         limiter.consume(nb).await;
                     }
+                    ce_metrics::inc_limiter_consume("total"); // CE-M0-3
                     total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        peer.send_raw(bytes.into()).await?;
+                        if let Err(e) = peer.send_raw(bytes.into()).await {
+                            ce_metrics::inc_relay_close("send_err"); // CE-M0-3
+                            return Err(e);
+                        }
                     }
                 } else {
+                    ce_metrics::inc_relay_close("client_eof"); // CE-M0-3
                     break;
                 }
             },
             _ = timer.tick() => {
                 if last_recv_time.elapsed().as_secs() > 30 {
+                    ce_metrics::inc_relay_close("timeout"); // CE-M0-3
                     bail!("Timeout");
                 }
             }
@@ -533,6 +562,7 @@ async fn relay(
         let n = tm.elapsed().as_millis() as usize;
         if n >= 1_000 {
             if BLOCKLIST.read().await.get(&ip).is_some() {
+                ce_metrics::inc_blocked("block_mid_relay"); // CE-M0-3
                 log::info!("{} blocked", ip);
                 break;
             }
@@ -553,6 +583,7 @@ async fn relay(
                 && total > elapsed * downgrade_threshold
             {
                 downgrade = true;
+                ce_metrics::inc_downgrade(); // CE-M0-3
                 log::info!(
                     "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
                     id,
@@ -644,4 +675,19 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     fn set_raw(&mut self) {}
+}
+
+// CE-M0-7: admin_cli handler。limiter 通过 GLOBAL_LIMITER 懒取,在 io_loop
+// 还没把 OnceCell 写好前,会先用一个临时 Limiter 兜底(不阻塞 admin 启动)。
+struct AdminCmdImpl;
+
+#[async_trait]
+impl crate::admin_cli::AdminCmd for AdminCmdImpl {
+    async fn run(&self, cmd: &str) -> String {
+        let limiter = GLOBAL_LIMITER
+            .get()
+            .cloned()
+            .unwrap_or_else(|| <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _));
+        check_cmd(cmd, limiter).await
+    }
 }

@@ -30,7 +30,7 @@ mac_address = "1.1.5"
 whoami = "1.2"
 base64 = "0.13"
 axum = { version = "0.5", features = ["headers"] }
-sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite", "macros", "chrono", "json" ] }
+sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite", "postgres", "macros", "chrono", "json" ] }
 deadpool = "0.8"
 async-trait = "0.1"
 async-speed-limit = { git = "https://github.com/open-trade/async-speed-limit" }
@@ -52,6 +52,9 @@ local-ip-address = "0.5.1"
 dns-lookup = "1.0.8"
 ping = "0.4.0"
 flate2 = "1.0"
+# CE-M0-3: Prometheus 监控独立端口
+metrics = "0.21"
+metrics-exporter-prometheus = { version = "0.12", default-features = false, features = ["http-listener"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 # https://github.com/rustdesk/rustdesk-server-pro/issues/189, using native-tls for better tls support

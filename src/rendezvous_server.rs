@@ -1,5 +1,7 @@
 use crate::common::*;
+use crate::metrics as ce_metrics;
 use crate::peer::*;
+use crate::tcp_punch_key::{helpers as tp_helpers, TcpPunchEntry, TcpPunchKey}; // CE-M0-6
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -20,7 +22,6 @@ use hbb_common::{
     timeout,
     tokio::{
         self,
-        io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
         sync::{mpsc, Mutex},
         time::{interval, Duration},
@@ -48,6 +49,12 @@ enum Data {
 }
 
 const REG_TIMEOUT: i32 = 30_000;
+// CE-M0-6: tcp_punch sink 在表中允许存活的最大时长(秒);与 REG_TIMEOUT 对齐。
+const TCP_PUNCH_TTL_SECS_DEFAULT: u64 = 30;
+// CE-M0-6: PeerMap 内存层条目最大不活跃时长(秒)。超过则从内存剔除,DB 不动。
+const PEER_MAP_IDLE_TTL_SECS_DEFAULT: u64 = 120;
+// CE-M0-6: 后台 GC 定时器间隔(秒)。
+const GC_INTERVAL_SECS: u64 = 60;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -65,7 +72,12 @@ static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex as TokioMutex; // differentiate if needed
 #[derive(Clone)]
-struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
+struct PunchReqEntry {
+    tm: Instant,
+    from_ip: String,
+    to_ip: String,
+    to_id: String,
+}
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
@@ -81,7 +93,9 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    // CE-M0-6: key 由 SocketAddr 改为 TcpPunchKey(含 peer_id),消除 NAT 下多设备互踩;
+    // value 由 Sink 改为 TcpPunchEntry,带入表时间用于后台 GC。
+    tcp_punch: Arc<Mutex<HashMap<TcpPunchKey, TcpPunchEntry<Sink>>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -147,6 +161,26 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        // CE-M0-7: 启动 UDS + token 管理 CLI(替换 listener2 的 loopback 旁路)。
+        {
+            let admin_cfg = crate::common::admin_config_from_env("hbbs");
+            let handler = std::sync::Arc::new(rs.clone());
+            crate::admin_cli::spawn_listener("hbbs", admin_cfg, handler);
+        }
+        // CE-M0-3: 5s 周期采样 PeerMap gauge,放在 tokio runtime 已就绪之后。
+        {
+            let pm = rs.pm.clone();
+            tokio::spawn(async move {
+                let mut tick = interval(Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    let len = pm.len_in_memory().await as i64;
+                    ce_metrics::set_peermap_entries(len);
+                    let online = pm.peers_online(REG_TIMEOUT as u128).await as i64;
+                    ce_metrics::set_peers_online(online);
+                }
+            });
+        }
         let mut listener = create_tcp_listener(port).await?;
         let mut listener2 = create_tcp_listener(nat_port).await?;
         let mut listener3 = create_tcp_listener(ws_port).await?;
@@ -238,6 +272,19 @@ impl RendezvousServer {
         key: &str,
     ) -> LoopFailure {
         let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
+        // CE-M0-6: 后台 GC,60s 一次清理超时 tcp_punch sink 与不活跃 PeerMap 条目。
+        // 阈值允许通过环境变量覆盖,留作运维兜底(详见任务卡 §4.4)。
+        let tcp_punch_ttl = std::env::var("TCP_PUNCH_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(TCP_PUNCH_TTL_SECS_DEFAULT);
+        let peer_map_ttl = std::env::var("PEER_MAP_IDLE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(PEER_MAP_IDLE_TTL_SECS_DEFAULT);
+        let mut timer_gc = interval(Duration::from_secs(GC_INTERVAL_SECS));
+        // tokio interval 第一拍立即触发,首拍跳过避免启动即扫表(此刻表必为空)。
+        timer_gc.tick().await;
         loop {
             tokio::select! {
                 _ = timer_check_relay.tick() => {
@@ -247,6 +294,21 @@ impl RendezvousServer {
                         tokio::spawn(async move {
                             check_relay_servers(rs, tx).await;
                         });
+                    }
+                }
+                _ = timer_gc.tick() => {
+                    // CE-M0-6: tcp_punch GC —— 删除入表超过 ttl 的 sink。
+                    let evicted_tp = {
+                        let mut map = self.tcp_punch.lock().await;
+                        tp_helpers::gc_tcp_punch(&mut map, tcp_punch_ttl)
+                    };
+                    if evicted_tp > 0 {
+                        log::debug!("tcp_punch GC evicted {} entries", evicted_tp);
+                    }
+                    // CE-M0-6: PeerMap GC —— 内存层不活跃条目剔除,DB 行保留。
+                    let evicted_pm = self.pm.gc(peer_map_ttl).await;
+                    if evicted_pm > 0 {
+                        log::debug!("peer_map GC evicted {} entries", evicted_pm);
                     }
                 }
                 Some(data) = rx.recv() => {
@@ -324,105 +386,21 @@ impl RendezvousServer {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
-                    // B registered
+                    // CE-M1-8: 走 process_register_peer 共享路径,UDP/TCP/WS 一致。
                     if !rp.id.is_empty() {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
-                        self.update_addr(rp.id, addr, socket).await?;
-                        if self.inner.serial > rp.serial {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_configure_update(ConfigUpdate {
-                                serial: self.inner.serial,
-                                rendezvous_servers: (*self.rendezvous_servers).clone(),
-                                ..Default::default()
-                            });
-                            socket.send(&msg_out, addr).await?;
+                        ce_metrics::inc_register("peer"); // CE-M0-3
+                        let out = self.process_register_peer(rp, addr).await;
+                        for msg in out {
+                            socket.send(&msg, addr).await?;
                         }
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
-                        return Ok(());
+                    // CE-M1-8: 走 process_register_pk 共享路径,UDP/TCP/WS 一致。
+                    if let Some(msg) = self.process_register_pk(rk, addr).await {
+                        socket.send(&msg, addr).await?;
                     }
-                    let id = rk.id;
-                    let ip = addr.ip().to_string();
-                    if id.len() < 6 {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                            }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
-                            )
-                        }
-                    };
-                    let mut req_pk = peer.read().await.reg_pk;
-                    if req_pk.1.elapsed().as_secs() > 6 {
-                        req_pk.0 = 0;
-                    } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    req_pk.0 += 1;
-                    req_pk.1 = Instant::now();
-                    peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
-                        let mut lock = IP_CHANGES.lock().await;
-                        if let Some((tm, ips)) = lock.get_mut(&id) {
-                            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                *tm = Instant::now();
-                                ips.clear();
-                                ips.insert(ip.clone(), 1);
-                            } else if let Some(v) = ips.get_mut(&ip) {
-                                *v += 1;
-                            } else {
-                                ips.insert(ip.clone(), 1);
-                            }
-                        } else {
-                            lock.insert(
-                                id.clone(),
-                                (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                            );
-                        }
-                    }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     if self.pm.is_in_memory(&ph.id).await {
@@ -493,7 +471,12 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        // CE-M0-6: key 含 peer_id,防止同 NAT 下不同 peer 互覆盖。
+                        let key = TcpPunchKey::new(addr, &ph.id);
+                        self.tcp_punch
+                            .lock()
+                            .await
+                            .insert(key, TcpPunchEntry::new(sink));
                     }
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
@@ -501,7 +484,12 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        // CE-M0-6: 同上,key 含 peer_id(RequestRelay 用 rf.id)。
+                        let key = TcpPunchKey::new(addr, &rf.id);
+                        self.tcp_punch
+                            .lock()
+                            .await
+                            .insert(key, TcpPunchEntry::new(sink));
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -553,14 +541,25 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: res.into(),
-                        ..Default::default()
-                    });
-                    Self::send_to_sink(sink, msg_out).await;
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    // CE-M1-8: WS / TCP 路径上的 RegisterPeer,与 UDP 共享 process_register_peer。
+                    if !rp.id.is_empty() {
+                        log::trace!("WS register_peer: {:?} {:?}", &rp.id, &addr);
+                        ce_metrics::inc_register("peer"); // CE-M0-3
+                        let out = self.process_register_peer(rp, addr).await;
+                        for msg in out {
+                            Self::send_to_sink(sink, msg).await;
+                        }
+                    }
+                    return true;
+                }
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    // CE-M1-8: WS / TCP 路径上的 RegisterPk,与 UDP 共享 process_register_pk。
+                    log::trace!("WS register_pk: {:?} {:?}", &rk.id, &addr);
+                    if let Some(msg) = self.process_register_pk(rk, addr).await {
+                        Self::send_to_sink(sink, msg).await;
+                    }
+                    return true;
                 }
                 _ => {}
             }
@@ -568,14 +567,15 @@ impl RendezvousServer {
         false
     }
 
+    /// CE-M1-8: 计算 `RegisterPeerResponse`(原 `update_addr` 中拆出的纯逻辑部分),
+    /// 不再持有 `&mut FramedSocket`,因此 UDP / TCP / WS 三条路径都可复用。
     #[inline]
-    async fn update_addr(
+    async fn compute_register_peer_response(
         &mut self,
-        id: String,
+        id: &str,
         socket_addr: SocketAddr,
-        socket: &mut FramedSocket,
-    ) -> ResultType<()> {
-        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
+    ) -> RegisterPeerResponse {
+        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(id).await {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
             let ip_change = if old.socket_addr.port() != 0 {
@@ -604,12 +604,144 @@ impl RendezvousServer {
         if let Some(old) = ip_change {
             log::info!("IP change of {} from {} to {}", id, old, socket_addr);
         }
-        let mut msg_out = RendezvousMessage::new();
-        msg_out.set_register_peer_response(RegisterPeerResponse {
+        RegisterPeerResponse {
             request_pk,
             ..Default::default()
+        }
+    }
+
+    /// CE-M1-8: RegisterPeer 共享处理逻辑。返回应当回写给客户端的 `RendezvousMessage` 列表
+    /// (`RegisterPeerResponse` 必发;`ConfigUpdate` 在 serial 落后时附带)。
+    /// 调用方决定通过 `FramedSocket` 还是 `Sink` 发送。
+    async fn process_register_peer(
+        &mut self,
+        rp: RegisterPeer,
+        addr: SocketAddr,
+    ) -> Vec<RendezvousMessage> {
+        let mut out = Vec::with_capacity(2);
+        if rp.id.is_empty() {
+            return out;
+        }
+        let resp = self.compute_register_peer_response(&rp.id, addr).await;
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_peer_response(resp);
+        out.push(msg_out);
+        if self.inner.serial > rp.serial {
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_configure_update(ConfigUpdate {
+                serial: self.inner.serial,
+                rendezvous_servers: (*self.rendezvous_servers).clone(),
+                ..Default::default()
+            });
+            out.push(msg_out);
+        }
+        out
+    }
+
+    /// CE-M1-8: RegisterPk 共享处理逻辑。封装 IP blocker / uuid 校验 / reg_pk 限流 /
+    /// `IP_CHANGES` 记录 / `pm.update_pk` 调用。返回 `None` 仅在 uuid/pk 为空时(沿用
+    /// UDP 旧行为:不回写任何响应)。
+    async fn process_register_pk(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+    ) -> Option<RendezvousMessage> {
+        if rk.uuid.is_empty() || rk.pk.is_empty() {
+            return None;
+        }
+        let id = rk.id;
+        let ip = addr.ip().to_string();
+        ce_metrics::inc_register("pk"); // CE-M0-3
+        if id.len() < 6 {
+            ce_metrics::inc_register_reject("uuid_mismatch"); // CE-M0-3
+            return Some(Self::make_rk_res(UUID_MISMATCH));
+        } else if !self.check_ip_blocker(&ip, &id).await {
+            ce_metrics::inc_register_reject("too_frequent"); // CE-M0-3
+            ce_metrics::inc_ip_blocked(); // CE-M0-3
+            return Some(Self::make_rk_res(TOO_FREQUENT));
+        }
+        let peer = self.pm.get_or(&id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == rk.uuid {
+                    if peer.info.ip != ip && peer.pk != rk.pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id,
+                            ip,
+                            rk.pk,
+                            peer.info.ip,
+                            peer.pk,
+                        );
+                        drop(peer);
+                        ce_metrics::inc_register_reject("uuid_mismatch"); // CE-M0-3
+                        return Some(Self::make_rk_res(UUID_MISMATCH));
+                    }
+                } else {
+                    log::warn!(
+                        "Peer {} uuid mismatch: {:?} vs {:?}",
+                        id,
+                        rk.uuid,
+                        peer.uuid
+                    );
+                    drop(peer);
+                    ce_metrics::inc_register_reject("uuid_mismatch"); // CE-M0-3
+                    return Some(Self::make_rk_res(UUID_MISMATCH));
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            ce_metrics::inc_register_reject("too_frequent"); // CE-M0-3
+            return Some(Self::make_rk_res(TOO_FREQUENT));
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(&id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.clone(), 1);
+                } else if let Some(v) = ips.get_mut(&ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.clone(), 1);
+                }
+            } else {
+                lock.insert(
+                    id.clone(),
+                    (Instant::now(), HashMap::from([(ip.clone(), 1)])),
+                );
+            }
+        }
+        if changed {
+            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+        }
+        Some(Self::make_rk_res(register_pk_response::Result::OK))
+    }
+
+    /// CE-M1-8: 构造 `RegisterPkResponse` 的薄封装。
+    #[inline]
+    fn make_rk_res(res: register_pk_response::Result) -> RendezvousMessage {
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_pk_response(RegisterPkResponse {
+            result: res.into(),
+            ..Default::default()
         });
-        socket.send(&msg_out, socket_addr).await
+        msg_out
     }
 
     #[inline]
@@ -688,7 +820,12 @@ impl RendezvousServer {
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
-            log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+            log::warn!(
+                "Authentication failed from {} for peer {} - invalid key",
+                addr,
+                ph.id
+            );
+            ce_metrics::inc_punch_hole_result("license_mismatch"); // CE-M0-3
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
@@ -708,6 +845,7 @@ impl RendezvousServer {
                 (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
             };
             if elapsed >= REG_TIMEOUT {
+                ce_metrics::inc_punch_hole_result("offline"); // CE-M0-3
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
@@ -715,7 +853,7 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
-            
+
             // record punch hole request (from addr -> peer id/peer_addr)
             {
                 let from_ip = try_into_v4(addr).ip().to_string();
@@ -723,13 +861,23 @@ impl RendezvousServer {
                 let to_id_clone = id.clone();
                 let mut lock = PUNCH_REQS.lock().await;
                 let mut dup = false;
-                for e in lock.iter().rev().take(30) { // only check recent tail subset for speed
+                for e in lock.iter().rev().take(30) {
+                    // only check recent tail subset for speed
                     if e.from_ip == from_ip && e.to_id == to_id_clone {
-                        if e.tm.elapsed().as_secs() < PUNCH_REQ_DEDUPE_SEC { dup = true; }
+                        if e.tm.elapsed().as_secs() < PUNCH_REQ_DEDUPE_SEC {
+                            dup = true;
+                        }
                         break;
                     }
                 }
-                if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
+                if !dup {
+                    lock.push(PunchReqEntry {
+                        tm: Instant::now(),
+                        from_ip,
+                        to_ip,
+                        to_id: to_id_clone,
+                    });
+                }
             }
 
             let mut msg_out = RendezvousMessage::new();
@@ -753,6 +901,7 @@ impl RendezvousServer {
                 });
             let socket_addr = AddrMangle::encode(addr).into();
             if same_intranet {
+                ce_metrics::inc_punch_hole_result("same_intranet"); // CE-M0-3
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
                     id,
@@ -765,6 +914,7 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             } else {
+                ce_metrics::inc_punch_hole_result("ok"); // CE-M0-3
                 log::debug!(
                     "Punch hole {:?} {:?} request from {:?}",
                     id,
@@ -780,6 +930,7 @@ impl RendezvousServer {
             }
             Ok((msg_out, Some(peer_addr)))
         } else {
+            ce_metrics::inc_punch_hole_result("id_not_exist"); // CE-M0-3
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
@@ -820,7 +971,12 @@ impl RendezvousServer {
 
     #[inline]
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        // CE-M0-6: 调用方没有 peer_id 时按 (ip, port) 反查 —— 旧入口(hole_sent / local_addr)
+        // 走这条路径。短期 O(n) 在 n < 10k 的可接受范围,后续工单可加 (ip,port)->key 双索引。
+        let mut tcp = {
+            let mut map = self.tcp_punch.lock().await;
+            tp_helpers::remove_by_addr(&mut map, addr).map(|e| e.sink)
+        };
         tokio::spawn(async move {
             Self::send_to_sink(&mut tcp, msg).await;
         });
@@ -848,7 +1004,35 @@ impl RendezvousServer {
         msg: RendezvousMessage,
         addr: SocketAddr,
     ) -> ResultType<()> {
-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        // CE-M0-6: 同 send_to_tcp,按 (ip, port) 反查 sink。
+        let mut sink = {
+            let mut map = self.tcp_punch.lock().await;
+            tp_helpers::remove_by_addr(&mut map, addr).map(|e| e.sink)
+        };
+        Self::send_to_sink(&mut sink, msg).await;
+        Ok(())
+    }
+
+    /// CE-M0-6: 调用方持有 peer_id 时走 O(1) 精确查表。
+    #[inline]
+    async fn send_to_tcp_by_key(
+        &mut self,
+        msg: RendezvousMessage,
+        addr: SocketAddr,
+        peer_id: &str,
+    ) -> ResultType<()> {
+        let key = TcpPunchKey::new(addr, peer_id);
+        let mut sink = self
+            .tcp_punch
+            .lock()
+            .await
+            .remove(&key)
+            .map(|e: TcpPunchEntry<Sink>| e.sink);
+        if sink.is_none() {
+            // 兜底:peer_id 不匹配时退化为按 (ip, port) 查,保证旧行为不丢失。
+            let mut map = self.tcp_punch.lock().await;
+            sink = tp_helpers::remove_by_addr(&mut map, addr).map(|e| e.sink);
+        }
         Self::send_to_sink(&mut sink, msg).await;
         Ok(())
     }
@@ -861,11 +1045,16 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        // CE-M0-3: 在入口插桩,区分 tcp/ws 两类 punch_hole 请求。
+        ce_metrics::inc_punch_hole(if ws { "ws" } else { "tcp" });
+        // CE-M0-6: 提前留住 peer_id,for 后续 by_key send。
+        let peer_id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
             self.tx.send(Data::Msg(msg.into(), addr))?;
         } else {
-            self.send_to_tcp_sync(msg, addr).await?;
+            // CE-M0-6: 已知 peer_id,走 O(1) by-key 查表,避免 NAT 下错配。
+            self.send_to_tcp_by_key(msg, addr, &peer_id).await?;
         }
         Ok(())
     }
@@ -877,6 +1066,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
+        ce_metrics::inc_punch_hole("udp"); // CE-M0-3
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
         self.tx.send(Data::Msg(
             msg.into(),
@@ -896,6 +1086,7 @@ impl RendezvousServer {
             if counter.1.elapsed().as_secs() > IP_BLOCK_DUR {
                 counter.0 = 0;
             } else if counter.0 > 30 {
+                ce_metrics::inc_ip_blocked(); // CE-M0-3
                 return false;
             }
             counter.0 += 1;
@@ -927,7 +1118,9 @@ impl RendezvousServer {
     fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
-        } else if self.relay_servers.len() == 1 {
+        }
+        ce_metrics::inc_relay_assign(); // CE-M0-3
+        if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
         }
         let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
@@ -1051,17 +1244,27 @@ impl RendezvousServer {
                 use std::fmt::Write as _;
                 let mut lock = PUNCH_REQS.lock().await;
                 let arg = fds.next();
-                if let Some("-") = arg { lock.clear(); }
-                else {
+                if let Some("-") = arg {
+                    lock.clear();
+                } else {
                     let mut start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
-                    let mut page_size = fds.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
-                    if page_size == 0 { page_size = 10; }
+                    let mut page_size = fds
+                        .next()
+                        .and_then(|x| x.parse::<usize>().ok())
+                        .unwrap_or(10);
+                    if page_size == 0 {
+                        page_size = 10;
+                    }
                     for (_, e) in lock.iter().enumerate().skip(start).take(page_size) {
                         let age = e.tm.elapsed();
                         let event_system = std::time::SystemTime::now() - age;
                         let event_iso = chrono::DateTime::<chrono::Utc>::from(event_system)
                             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                        let _ = writeln!(res, "{} {} -> {}@{}", event_iso, e.from_ip, e.to_id, e.to_ip);
+                        let _ = writeln!(
+                            res,
+                            "{} {} -> {}@{}",
+                            event_iso, e.from_ip, e.to_id, e.to_ip
+                        );
                     }
                 }
             }
@@ -1101,20 +1304,10 @@ impl RendezvousServer {
 
     async fn handle_listener2(&self, stream: TcpStream, addr: SocketAddr) {
         let mut rs = self.clone();
-        let ip = try_into_v4(addr).ip();
-        if ip.is_loopback() {
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut buffer = [0; 1024];
-                if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
-                    if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
-                        let res = rs.check_cmd(data).await;
-                        stream.write(res.as_bytes()).await.ok();
-                    }
-                }
-            });
-            return;
-        }
+        // CE-M0-7: 旧实现把 loopback 来的连接当作管理 CLI(零认证),已迁移到
+        // `admin_cli` 走 UDS + token。listener2 这里只保留 NAT-test / OnlineRequest
+        // 协议路径。
+        let _ = addr;
         let stream = FramedStream::from(stream, addr);
         tokio::spawn(async move {
             let mut stream = stream;
@@ -1144,7 +1337,15 @@ impl RendezvousServer {
         let mut rs = self.clone();
         let key = key.to_owned();
         tokio::spawn(async move {
-            allow_err!(rs.handle_listener_inner(stream, addr, &key, ws).await);
+            // CE-M0-3: WS 连接活跃数 gauge,只在 ws 路径上计数。
+            if ws {
+                ce_metrics::inc_ws_active(1);
+            }
+            let res = rs.handle_listener_inner(stream, addr, &key, ws).await;
+            if ws {
+                ce_metrics::inc_ws_active(-1);
+            }
+            allow_err!(res);
         });
     }
 
@@ -1194,7 +1395,10 @@ impl RendezvousServer {
             }
         }
         if sink.is_none() {
-            self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+            // CE-M0-6: 连接关闭兜底:此时无法定位 peer_id,按 (ip, port) 清掉
+            // 所有挂在该 addr 上的条目,与旧版语义一致。
+            let mut map = self.tcp_punch.lock().await;
+            let _ = tp_helpers::remove_all_by_addr(&mut map, addr);
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
@@ -1338,6 +1542,8 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
 }
 
 #[inline]
+#[allow(dead_code)]
+// CE-M1-8: UDP 路径已统一走 `process_register_pk` → `make_rk_res`,本函数保留兜底。
 async fn send_rk_res(
     socket: &mut FramedSocket,
     addr: SocketAddr,
@@ -1368,4 +1574,77 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+// CE-M0-7: 让 RendezvousServer 充当 admin_cli 的命令处理器。
+#[async_trait::async_trait]
+impl crate::admin_cli::AdminCmd for RendezvousServer {
+    async fn run(&self, cmd: &str) -> String {
+        self.check_cmd(cmd).await
+    }
+}
+
+// CE-M0-6: tcp_punch GC / 强类型 key 的回归测试。
+// 测试逻辑挂在 tcp_punch_key::helpers 上,这里只是把入口名字摆到 rendezvous
+// 模块下,方便 `cargo test rendezvous` 直接抓到。
+#[cfg(test)]
+mod rendezvous_gc_tests {
+    use crate::tcp_punch_key::{helpers, TcpPunchEntry, TcpPunchKey};
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::{Duration, Instant};
+
+    fn sa(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)
+    }
+
+    #[test]
+    fn test_tcp_punch_ttl_evicts() {
+        let mut m: HashMap<TcpPunchKey, TcpPunchEntry<()>> = HashMap::new();
+        let k_old = TcpPunchKey::new(sa([10, 0, 0, 1], 1000), "old");
+        let k_new = TcpPunchKey::new(sa([10, 0, 0, 1], 1001), "new");
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        m.insert(
+            k_old.clone(),
+            TcpPunchEntry {
+                sink: (),
+                inserted_at: past,
+            },
+        );
+        m.insert(k_new.clone(), TcpPunchEntry::new(()));
+        // 与 RendezvousServer::io_loop 内一致:用 TCP_PUNCH_TTL_SECS_DEFAULT 作阈值。
+        let evicted = helpers::gc_tcp_punch(&mut m, super::TCP_PUNCH_TTL_SECS_DEFAULT);
+        assert_eq!(evicted, 1);
+        assert!(!m.contains_key(&k_old));
+        assert!(m.contains_key(&k_new));
+    }
+
+    #[test]
+    fn test_tcp_punch_key_two_devices_same_nat() {
+        // 同 IP + 同 port + 不同 peer_id:两条共存,互不覆盖(失败模式 1 的回归)。
+        let mut m: HashMap<TcpPunchKey, TcpPunchEntry<u8>> = HashMap::new();
+        let addr = sa([100, 64, 0, 1], 33333);
+        let k_a = TcpPunchKey::new(addr, "device_a");
+        let k_b = TcpPunchKey::new(addr, "device_b");
+        m.insert(k_a.clone(), TcpPunchEntry::new(1));
+        m.insert(k_b.clone(), TcpPunchEntry::new(2));
+        assert_eq!(m.len(), 2);
+        // by-key 精确查找互不干扰
+        assert_eq!(m.get(&k_a).map(|e| e.sink), Some(1));
+        assert_eq!(m.get(&k_b).map(|e| e.sink), Some(2));
+    }
+
+    #[test]
+    fn test_send_to_tcp_fallback_no_peer_id() {
+        // fallback by-(ip, port) 取走第一条匹配条目,空时返回 None 不 panic。
+        let mut m: HashMap<TcpPunchKey, TcpPunchEntry<u32>> = HashMap::new();
+        let addr = sa([192, 168, 0, 10], 22000);
+        m.insert(TcpPunchKey::new(addr, "peer_z"), TcpPunchEntry::new(99u32));
+        let hit = helpers::remove_by_addr(&mut m, addr);
+        assert_eq!(hit.map(|e| e.sink), Some(99));
+        // 再 remove 应安全返回 None。
+        assert!(helpers::remove_by_addr(&mut m, addr).is_none());
+    }
 }

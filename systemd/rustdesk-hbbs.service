@@ -7,8 +7,33 @@ Type=simple
 LimitNOFILE=1000000
 ExecStart=/usr/bin/hbbs
 WorkingDirectory=/var/lib/rustdesk-server/
-User=
-Group=
+# CE-M0-5: run as a dedicated unprivileged user/group; CE-M0-7 relies on this
+# uid/gid being stable so the admin UDS chmod 0660 + SO_PEERCRED check is meaningful.
+User=rustdesk
+Group=rustdesk
+# CE-M0-7: systemd-managed runtime/state directories for the admin CLI.
+# /run/rustdesk-server/{hbbs,hbbr}.sock and /var/lib/rustdesk-server/admin.token
+# get their parents auto-created with mode 0750, owned by rustdesk:rustdesk.
+RuntimeDirectory=rustdesk-server
+RuntimeDirectoryMode=0750
+StateDirectory=rustdesk-server
+StateDirectoryMode=0750
+# CE-M0-5: systemd 沙箱加固。hbbs 仅需读写 /var/lib/rustdesk-server(SQLite/key)
+# 与 /var/log/rustdesk-server(StandardOutput/StandardError append)。日志目录不归
+# StateDirectory 管理,故必须显式列入 ReadWritePaths,否则 ProtectSystem=strict
+# 会让 append 写入失败。低端口未使用,无需 CAP_NET_BIND_SERVICE。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/rustdesk-server /var/log/rustdesk-server
 Restart=always
 StandardOutput=append:/var/log/rustdesk-server/hbbs.log
 StandardError=append:/var/log/rustdesk-server/hbbs.error

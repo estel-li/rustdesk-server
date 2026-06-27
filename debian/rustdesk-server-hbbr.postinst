@@ -4,12 +4,22 @@ set -e
 SERVICE=rustdesk-hbbr.service
 
 if [ "$1" = "configure" ]; then
+    # CE-M0-5: 幂等创建专用系统用户。与 hbbs.postinst 对称,装包顺序无关。
+    if ! getent passwd rustdesk >/dev/null; then
+        adduser --system --group --no-create-home \
+                --home /var/lib/rustdesk-server \
+                --shell /usr/sbin/nologin \
+                rustdesk
+    fi
     mkdir -p /var/log/rustdesk-server
 fi
 
 case "$1" in
     configure|abort-upgrade|abort-deconfigure|abort-remove)
       mkdir -p /var/lib/rustdesk-server/
+      # CE-M0-5: 同步 chown,与 hbbs.postinst 一致。两个包都执行不冲突。
+      chown -R rustdesk:rustdesk /var/lib/rustdesk-server /var/log/rustdesk-server || true
+      chmod 0750 /var/lib/rustdesk-server /var/log/rustdesk-server || true
 	  deb-systemd-helper unmask "${SERVICE}" >/dev/null || true
 	  if deb-systemd-helper --quiet was-enabled "${SERVICE}"; then
 	  	deb-systemd-invoke enable "${SERVICE}" >/dev/null || true

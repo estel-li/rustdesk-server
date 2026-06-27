@@ -4,12 +4,24 @@ set -e
 SERVICE=rustdesk-hbbs.service
 
 if [ "$1" = "configure" ]; then
+    # CE-M0-5: 幂等创建专用系统用户。两个 deb(hbbs/hbbr)共用 rustdesk 账号,
+    # getent 守卫保证后装的包不会重复 adduser 报错。
+    if ! getent passwd rustdesk >/dev/null; then
+        adduser --system --group --no-create-home \
+                --home /var/lib/rustdesk-server \
+                --shell /usr/sbin/nologin \
+                rustdesk
+    fi
     mkdir -p /var/log/rustdesk-server
 fi
 
 case "$1" in
     configure|abort-upgrade|abort-deconfigure|abort-remove)
       mkdir -p /var/lib/rustdesk-server/
+      # CE-M0-5: 把运行/日志目录(及其历史 root 所属的 SQLite/key)交给 rustdesk,
+      # 否则 ProtectSystem=strict + User=rustdesk 起来后无法读写。失败不阻断升级。
+      chown -R rustdesk:rustdesk /var/lib/rustdesk-server /var/log/rustdesk-server || true
+      chmod 0750 /var/lib/rustdesk-server /var/log/rustdesk-server || true
 	  deb-systemd-helper unmask "${SERVICE}" >/dev/null || true
 	  if deb-systemd-helper --quiet was-enabled "${SERVICE}"; then
 	  	deb-systemd-invoke enable "${SERVICE}" >/dev/null || true
