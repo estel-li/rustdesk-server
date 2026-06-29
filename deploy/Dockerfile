@@ -9,9 +9,9 @@
 # (指向 estel-li/hbb_common-ce @ ce/base,见 docs/operations/hbb_common-ce.md)。
 
 # ---- 编译阶段 ----
-# Rust 1.85+ 必需:Cargo.lock 里 time-core 0.1.9 等依赖需要 edition2024
-# (1.85.0 才把 edition2024 稳定化,2025-02 发布)
-FROM rust:1.85-slim-bookworm AS builder
+# Rust 1.88+ 必需:Cargo.lock 里 time / time-core / time-macros 要 1.88,
+# wayland-protocols 要 1.86。1.85 装下来 cargo 一开局直接拒绝解依赖。
+FROM rust:1.88-slim-bookworm AS builder
 
 # CE-M0-2 引入了 sqlx + postgres feature,需要 pkg-config / libssl-dev / libpq-dev
 # CE 全部 build deps:protoc(hbb_common build.rs)、cmake/clang(部分上游 crate)
