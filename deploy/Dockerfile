@@ -50,7 +50,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim AS runtime-base
 
 # tini = pid1,signals;libssl3/libpq5 = sqlx 运行期需要;ca-certificates = TLS;
-# adduser/passwd = 创建 rustdesk 系统用户
+# adduser/passwd = 创建 rustdesk 系统用户;util-linux 自带 setpriv(entrypoint 降权用)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
@@ -65,22 +65,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chmod 0750 /var/lib/rustdesk-server /var/log/rustdesk-server \
     && chmod 0770 /run/rustdesk-server
 
+# Entrypoint 脚本:启动时 chown 数据目录 + 降权到 rustdesk。详见脚本内注释。
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
 WORKDIR /var/lib/rustdesk-server
 
 # ---- hbbs target ----
 FROM runtime-base AS hbbs
 COPY --from=builder /out/hbbs /usr/local/bin/hbbs
-USER rustdesk:rustdesk
+# 注意:这里 *不* USER rustdesk —— 必须以 root 进入 entrypoint 才能 chown
+# bind mount 目录,entrypoint 内部用 setpriv 降权到 rustdesk(UID 1000)。
 # 21115 NAT、21116 tcp+udp ID 注册、21118 WebSocket、21120 metrics(loopback 默认)
 EXPOSE 21115 21116 21116/udp 21118 21120
 VOLUME ["/var/lib/rustdesk-server"]
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hbbs"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh", "/usr/local/bin/hbbs"]
 
 # ---- hbbr target ----
 FROM runtime-base AS hbbr
 COPY --from=builder /out/hbbr /usr/local/bin/hbbr
-USER rustdesk:rustdesk
+# 同 hbbs:root 进 entrypoint → setpriv 降权后跑 hbbr
 # 21117 TCP relay、21119 WebSocket relay、21121 metrics(loopback 默认)
 EXPOSE 21117 21119 21121
 VOLUME ["/var/lib/rustdesk-server"]
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hbbr"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh", "/usr/local/bin/hbbr"]
